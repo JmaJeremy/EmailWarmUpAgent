@@ -1,0 +1,145 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Base ─────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+  --bg-base: #080B14;
+  --bg-surface: #0F1221;
+  --bg-card: #161929;
+  --border: #1E2436;
+  --orange: #FF6B35;
+  --green: #00D68F;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  font-family: 'Inter', system-ui, sans-serif;
+  background-color: var(--bg-base);
+  color: #FFFFFF;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  min-height: 100vh;
+}
+
+#root { min-height: 100vh; }
+
+/* ── Scrollbar ────────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: #2A3050; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3A4060; }
+
+/* ── Animations ───────────────────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes scoreRing {
+  from { stroke-dashoffset: 283; }
+  to   { stroke-dashoffset: var(--dash-offset); }
+}
+@keyframes pulse-ring {
+  0%   { transform: scale(1); opacity: 1; }
+  100% { transform: scale(1.4); opacity: 0; }
+}
+
+.animate-fade-in { animation: fadeIn 0.35s ease-out both; }
+.animate-fade-in-delay { animation: fadeIn 0.35s ease-out 0.1s both; }
+
+/* ── Glass card ───────────────────────────────────────────────────────── */
+.glass-card {
+  background: linear-gradient(135deg, rgba(22,25,41,0.9) 0%, rgba(15,18,33,0.9) 100%);
+  border: 1px solid rgba(255,255,255,0.06);
+  backdrop-filter: blur(12px);
+}
+
+/* ── Gradient text ────────────────────────────────────────────────────── */
+.text-gradient-orange {
+  background: linear-gradient(135deg, #FF6B35, #FFB347);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.text-gradient-green {
+  background: linear-gradient(135deg, #00D68F, #00F5A0);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Skeleton loader ─────────────────────────────────────────────────── */
+.skeleton {
+  background: linear-gradient(90deg, #161929 25%, #1C2035 50%, #161929 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: 6px;
+}
+
+/* ── Score ring animation ────────────────────────────────────────────── */
+.score-ring circle {
+  stroke-dasharray: 283;
+  stroke-dashoffset: 283;
+  animation: scoreRing 1.2s ease-out forwards;
+  transform-origin: center;
+  transform: rotate(-90deg);
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+.sidebar-link {
+  @apply flex items-center gap-3 px-4 py-3 rounded-xl text-text-secondary text-sm font-medium
+         transition-all duration-200 cursor-pointer;
+}
+.sidebar-link:hover {
+  @apply bg-bg-elevated text-text-primary;
+}
+.sidebar-link.active {
+  @apply bg-orange/10 text-orange border border-orange/20;
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────── */
+.btn-primary {
+  @apply flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl
+         bg-gradient-to-r from-orange to-orange-dark text-white font-semibold text-sm
+         transition-all duration-200 shadow-orange-glow hover:shadow-lg hover:scale-[1.02]
+         active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed;
+}
+.btn-secondary {
+  @apply flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl
+         bg-bg-elevated border border-border text-text-primary font-medium text-sm
+         transition-all duration-200 hover:border-orange/40 hover:bg-bg-card
+         active:scale-[0.98];
+}
+.btn-ghost {
+  @apply flex items-center justify-center gap-2 px-4 py-2 rounded-lg
+         text-text-secondary text-sm font-medium
+         transition-all duration-200 hover:text-white hover:bg-bg-elevated;
+}
+.btn-danger {
+  @apply flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl
+         bg-red-500/10 border border-red-500/20 text-red-400 font-medium text-sm
+         transition-all duration-200 hover:bg-red-500/20;
+}
+
+/* ── Input ────────────────────────────────────────────────────────────── */
+.input-field {
+  @apply w-full px-4 py-3 rounded-xl bg-bg-elevated border border-border
+         text-white placeholder-text-muted text-sm
+         focus:outline-none focus:ring-2 focus:ring-orange/50 focus:border-orange/50
+         transition-all duration-200;
+}
+
+/* ── Status badge ─────────────────────────────────────────────────────── */
+.badge-active   { @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-green/10 text-green border border-green/20; }
+.badge-paused   { @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-yellow-500/10 text-yellow-400 border border-yellow-500/20; }
+.badge-pending  { @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-accent/10 text-blue-accent border border-blue-accent/20; }
+.badge-completed { @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-purple-500/10 text-purple-400 border border-purple-500/20; }
+.badge-error    { @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-red-500/10 text-red-400 border border-red-500/20; }
