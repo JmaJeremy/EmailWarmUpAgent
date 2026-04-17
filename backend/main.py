@@ -28,8 +28,10 @@ def seed_super_admin():
 
     db = SessionLocal()
     try:
+        logger.info(f"🔍 Checking for super admin: {settings.super_admin_email}")
         existing = db.query(User).filter(User.email == settings.super_admin_email).first()
         if existing:
+            logger.info(f"✅ Super admin already exists: {settings.super_admin_email} (active={existing.is_active})")
             return  # Already seeded
 
         logger.info("🌱 Seeding Neurogenix super admin...")
@@ -46,6 +48,9 @@ def seed_super_admin():
             )
             db.add(company)
             db.flush()
+            logger.info("🏢 Created Neurogenix company")
+        else:
+            logger.info(f"🏢 Using existing company: {company.name}")
 
         user = User(
             id=str(uuid.uuid4()),
@@ -54,12 +59,13 @@ def seed_super_admin():
             full_name="Neurogenix Admin",
             password_hash=hash_password(settings.super_admin_password),
             role=UserRole.super_admin,
+            is_active=True,
         )
         db.add(user)
         db.commit()
         logger.info(f"✅ Super admin created: {settings.super_admin_email}")
     except Exception as e:
-        logger.error(f"Seed error: {e}")
+        logger.error(f"❌ Seed error: {e}", exc_info=True)
         db.rollback()
     finally:
         db.close()
