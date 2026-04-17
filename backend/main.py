@@ -95,9 +95,21 @@ app = FastAPI(
 )
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
+_cors_origins = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "https://localhost:5173",
+]
+# Add production frontend URL from env if set
+if settings.frontend_url and settings.frontend_url != "http://localhost:5173":
+    _cors_origins.append(settings.frontend_url)
+# Allow all Railway subdomains in production
+_cors_origins.append("https://emailwarmupagent-production.up.railway.app")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:3000", "http://localhost:5173"],
+    allow_origins=_cors_origins,
+    allow_origin_regex=r"https://.*\.up\.railway\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
