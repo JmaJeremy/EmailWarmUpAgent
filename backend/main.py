@@ -28,13 +28,13 @@ def seed_super_admin():
 
     db = SessionLocal()
     try:
-        logger.info(f"🔍 Checking for super admin: {settings.super_admin_email}")
         existing = db.query(User).filter(User.email == settings.super_admin_email).first()
         if existing:
-            logger.info(f"✅ Super admin already exists: {settings.super_admin_email} (active={existing.is_active})")
+            # Force sync the password in case it was changed in Railway ENV
+            existing.password_hash = hash_password(settings.super_admin_password)
+            db.commit()
+            logger.info(f"✅ Super admin already exists. Password synchronized! (active={existing.is_active})")
             return  # Already seeded
-
-        logger.info("🌱 Seeding Neurogenix super admin...")
 
         company = db.query(Company).filter(Company.slug == "neurogenix").first()
         if not company:
