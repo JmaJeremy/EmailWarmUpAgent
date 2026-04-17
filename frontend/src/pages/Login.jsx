@@ -284,7 +284,7 @@ export default function Login() {
           )}
 
           <p className="text-center text-text-muted text-xs mt-6">
-            © 2025 Neurogenix. Enterprise Email Warmup Platform.
+            © {new Date().getFullYear()} Neurogenix. Enterprise Email Warmup Platform.
           </p>
         </div>
       </div>
