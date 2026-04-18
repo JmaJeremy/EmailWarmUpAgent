@@ -64,14 +64,20 @@ def get_google_auth_url(
 
     logger.info(f"🔑 Google OAuth URL requested for mailbox: {mailbox_id}")
     logger.info(f"   redirect_uri: {settings.google_redirect_uri}")
-    logger.info(f"   client_id starts: {settings.google_client_id[:20]}...")
-    flow = _google_flow()
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-        state=mailbox_id,
-    )
+
+    import urllib.parse
+    # Build auth URL manually — no PKCE code_challenge (google_auth_oauthlib adds it automatically)
+    params = {
+        "client_id":              settings.google_client_id,
+        "redirect_uri":           settings.google_redirect_uri,
+        "response_type":          "code",
+        "scope":                  " ".join(GOOGLE_SCOPES),
+        "access_type":            "offline",
+        "include_granted_scopes": "true",
+        "prompt":                 "consent",
+        "state":                  mailbox_id,
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
     return {"auth_url": auth_url}
 
 
