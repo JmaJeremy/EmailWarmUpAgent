@@ -62,12 +62,15 @@ def get_google_auth_url(
     if not settings.google_client_id or not settings.google_client_secret:
         raise HTTPException(status_code=501, detail="Google OAuth not configured in environment variables")
 
+    logger.info(f"🔑 Google OAuth URL requested for mailbox: {mailbox_id}")
+    logger.info(f"   redirect_uri: {settings.google_redirect_uri}")
+    logger.info(f"   client_id starts: {settings.google_client_id[:20]}...")
     flow = _google_flow()
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",            # always get refresh_token
-        state=mailbox_id,            # we pass mailbox_id as state to link on callback
+        prompt="consent",
+        state=mailbox_id,
     )
     return {"auth_url": auth_url}
 
@@ -123,6 +126,8 @@ def google_callback(
         )
 
     except Exception as e:
-        logger.error(f"❌ Google OAuth callback error: {e}", exc_info=True)
-        return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=token_exchange_failed")
+        import urllib.parse
+        error_detail = urllib.parse.quote(str(e)[:200])
+        logger.error(f"❌ Google OAuth callback error: {type(e).__name__}: {e}", exc_info=True)
+        return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=token_exchange_failed&detail={error_detail}")
 
