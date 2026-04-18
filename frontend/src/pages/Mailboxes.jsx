@@ -397,7 +397,6 @@ function AddMailboxModal({ onClose, onAdded }) {
 }
 
 // ── External Contacts Section ────────────────────────────────────────────────
-import api from '../api/client'
 
 const externalContactsApi = {
   list:   ()           => api.get('/external-contacts'),
