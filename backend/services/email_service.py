@@ -324,7 +324,7 @@ class EmailService:
         return msg
 
     # ── Gmail API: Send warmup email ─────────────────────────────────────────
-    def _send_via_gmail_api(self, to_email: str, to_name: Optional[str] = None) -> bool:
+    def _send_via_gmail_api(self, to_email: str, to_name: Optional[str] = None, msg: Optional[MIMEMultipart] = None) -> bool:
         """Send email using Gmail API (HTTPS) — works on Railway, no SMTP needed."""
         try:
             import json, base64
@@ -345,8 +345,8 @@ class EmailService:
             creds.refresh(Request())
 
             service = build("gmail", "v1", credentials=creds)
-            msg = self._build_mime_message(to_email, to_name)
-            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+            msg_to_send = msg or self._build_mime_message(to_email, to_name)
+            raw = base64.urlsafe_b64encode(msg_to_send.as_bytes()).decode("utf-8")
             service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
             logger.info(f"✅ Gmail API sent: {self.mailbox.email_address} → {to_email}")
@@ -356,10 +356,10 @@ class EmailService:
             return False
 
     # ── SMTP: Send warmup email ──────────────────────────────────────────────
-    def _send_via_smtp(self, to_email: str, to_name: Optional[str] = None) -> bool:
+    def _send_via_smtp(self, to_email: str, to_name: Optional[str] = None, msg: Optional[MIMEMultipart] = None) -> bool:
         """Send a single warmup email via SMTP."""
         try:
-            msg = self._build_mime_message(to_email, to_name)
+            msg_to_send = msg or self._build_mime_message(to_email, to_name)
 
             if self.mailbox.smtp_use_tls:
                 server = smtplib.SMTP(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
@@ -370,7 +370,7 @@ class EmailService:
                 server = smtplib.SMTP_SSL(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
 
             server.login(self.mailbox.smtp_user, self.smtp_password)
-            server.sendmail(self.mailbox.email_address, to_email, msg.as_string())
+            server.sendmail(self.mailbox.email_address, to_email, msg_to_send.as_string())
             server.quit()
 
             logger.info(f"✅ SMTP sent: {self.mailbox.email_address} → {to_email}")
@@ -525,16 +525,13 @@ class EmailService:
                     body = reply_template + f"\n\n— {sig}"
                     reply.attach(MIMEText(body, "plain"))
 
-                    # Send via SMTP
-                    if self.mailbox.smtp_use_tls:
-                        server = smtplib.SMTP(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
-                        server.ehlo(); server.starttls(); server.ehlo()
+                    # Send reply using the correct auth route
+                    if getattr(self.mailbox, "auth_type", "smtp") == "gmail_api":
+                        self._send_via_gmail_api(to_email=from_addr, msg=reply)
+                    elif getattr(self.mailbox, "auth_type", "smtp") == "microsoft_graph":
+                        pass # self._send_via_microsoft_graph(to_email=from_addr, msg=reply)
                     else:
-                        server = smtplib.SMTP_SSL(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
-
-                    server.login(self.mailbox.smtp_user, self.smtp_password)
-                    server.sendmail(self.mailbox.email_address, from_addr, reply.as_string())
-                    server.quit()
+                        self._send_via_smtp(to_email=from_addr, msg=reply)
 
                     # Mark as ANSWERED — prevents future duplicate replies
                     mail.store(msg_id, "+FLAGS", "\\Answered")
