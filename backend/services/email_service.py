@@ -435,6 +435,12 @@ class EmailService:
                                 for s in WARMUP_SUBJECTS
                             )
                             if is_warmup:
+                                # Properly rescue from Spam/Promotions by moving to INBOX
+                                if folder.upper() != "INBOX":
+                                    mail.copy(msg_id, "INBOX")               # Copy to Inbox
+                                    mail.store(msg_id, "+FLAGS", "\\Deleted")# Delete from Spam
+                                    mail.expunge()                           # Ensure deletion
+                                    
                                 mail.store(msg_id, "+FLAGS", "\\Seen")      # Mark read
                                 mail.store(msg_id, "+FLAGS", "\\Flagged")   # Star it
                                 opened_count += 1
