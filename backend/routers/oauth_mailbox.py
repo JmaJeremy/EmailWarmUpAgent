@@ -100,17 +100,36 @@ def google_callback(
         return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=mailbox_not_found")
 
     try:
-        flow = _google_flow()
-        flow.fetch_token(code=code)
-        creds = flow.credentials
+        import requests as http_requests
 
-        if not creds.refresh_token:
-            return RedirectResponse(
-                f"{frontend_url}/mailboxes?oauth_error=no_refresh_token"
-            )
+        # Exchange the auth code for tokens directly via HTTP POST
+        # (avoids PKCE code_verifier issue with google_auth_oauthlib)
+        token_response = http_requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code":          code,
+                "client_id":     settings.google_client_id,
+                "client_secret": settings.google_client_secret,
+                "redirect_uri":  settings.google_redirect_uri,
+                "grant_type":    "authorization_code",
+            },
+        )
+        token_data_raw = token_response.json()
+        logger.info(f"🔄 Token exchange response keys: {list(token_data_raw.keys())}")
+
+        if "error" in token_data_raw:
+            logger.error(f"❌ Token exchange error: {token_data_raw}")
+            import urllib.parse
+            detail = urllib.parse.quote(str(token_data_raw.get("error_description", token_data_raw.get("error")))[:200])
+            return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=google_rejected&detail={detail}")
+
+        refresh_token = token_data_raw.get("refresh_token")
+        if not refresh_token:
+            logger.error(f"❌ No refresh_token in response. Keys: {list(token_data_raw.keys())}")
+            return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=no_refresh_token")
 
         token_data = json.dumps({
-            "refresh_token": creds.refresh_token,
+            "refresh_token": refresh_token,
             "client_id":     settings.google_client_id,
             "client_secret": settings.google_client_secret,
         })
