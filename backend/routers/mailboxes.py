@@ -47,6 +47,7 @@ def _mailbox_to_dict(m: Mailbox, include_creds: bool = False) -> dict:
         "company_id": m.company_id,
         "email_address": m.email_address,
         "display_name": m.display_name,
+        "auth_type": getattr(m, "auth_type", "smtp") or "smtp",  # gmail_api | smtp
         "smtp_host": m.smtp_host,
         "smtp_port": m.smtp_port,
         "smtp_user": m.smtp_user,
@@ -67,6 +68,7 @@ def _mailbox_to_dict(m: Mailbox, include_creds: bool = False) -> dict:
         "created_at": m.created_at,
     }
     return d
+
 
 
 def _get_user_company_id(current_user: User) -> str:
