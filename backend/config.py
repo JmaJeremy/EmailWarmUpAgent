@@ -37,6 +37,8 @@ class Settings(BaseSettings):
 
     # Google OAuth (set GOOGLE_CLIENT_ID in .env after creating a Google Cloud project)
     google_client_id: str = ""
+    google_client_secret: str = ""  # needed for Gmail API OAuth token exchange
+    google_redirect_uri: str = "http://localhost:8000/mailboxes/oauth/google-callback"
 
     class Config:
         env_file = ".env"

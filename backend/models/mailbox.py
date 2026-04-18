@@ -1,5 +1,6 @@
 """
 Mailbox Model — SMTP/IMAP credentials + warmup state
+Supports auth_type: smtp | gmail_api | microsoft_graph
 """
 import uuid
 from datetime import datetime
@@ -26,6 +27,10 @@ class Mailbox(Base):
     # ── Identity ────────────────────────────────────────────────────────────
     email_address = Column(String(255), nullable=False, index=True)
     display_name = Column(String(255), nullable=True)
+
+    # ── Auth type (smtp | gmail_api | microsoft_graph) ──────────────────────
+    auth_type = Column(String(32), default="smtp", nullable=False)
+    oauth_refresh_token_enc = Column(Text, nullable=True)  # encrypted OAuth refresh token
 
     # ── SMTP (Sending) ───────────────────────────────────────────────────────
     smtp_host = Column(String(255), nullable=False)

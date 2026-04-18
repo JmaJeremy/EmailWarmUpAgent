@@ -12,6 +12,7 @@ from database import create_tables, SessionLocal
 from config import settings
 from services.scheduler import start_scheduler, stop_scheduler
 from routers import auth, companies, mailboxes, warmup, dashboard, external_contacts, access_requests
+from routers import oauth_mailbox
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,6 +134,7 @@ app.include_router(warmup.router)
 app.include_router(dashboard.router)
 app.include_router(external_contacts.router)
 app.include_router(access_requests.router)
+app.include_router(oauth_mailbox.router)
 
 
 @app.get("/", tags=["Health"])

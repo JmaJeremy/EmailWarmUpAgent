@@ -281,12 +281,17 @@ WARMUP_REPLIES = [
 
 
 class EmailService:
-    """Handles SMTP sending and IMAP reading for a single mailbox."""
+    """Handles email sending (SMTP or Gmail API) and IMAP reading for a single mailbox."""
 
     def __init__(self, mailbox):
-        self.mailbox       = mailbox
-        self.smtp_password = decrypt_password(mailbox.smtp_password_enc)
-        self.imap_password = decrypt_password(mailbox.imap_password_enc)
+        self.mailbox = mailbox
+        # Only decrypt SMTP password if the mailbox uses SMTP
+        if getattr(mailbox, 'auth_type', 'smtp') == 'smtp':
+            self.smtp_password = decrypt_password(mailbox.smtp_password_enc) if mailbox.smtp_password_enc else ''
+        else:
+            self.smtp_password = ''
+        # IMAP password always needed (reading is always IMAP)
+        self.imap_password = decrypt_password(mailbox.imap_password_enc) if mailbox.imap_password_enc else ''
 
     def _first_name(self, display_name: Optional[str], email_addr: str) -> str:
         """Extract first name from display name or email prefix."""
@@ -300,35 +305,61 @@ class EmailService:
         first = name.strip().split()[0]
         return first
 
-    # ── SMTP: Send warmup email ──────────────────────────────────────────────
-    def send_warmup_email(self, to_email: str, to_name: Optional[str] = None) -> bool:
-        """Send a single warmup email via SMTP with humanised body/subject."""
+    # ── Shared: build MIME message ───────────────────────────────────────────
+    def _build_mime_message(self, to_email: str, to_name: Optional[str]) -> MIMEMultipart:
+        """Build the warmup MIME message (used by all send methods)."""
+        msg = MIMEMultipart("alternative")
+        sender_display = self.mailbox.display_name or self.mailbox.email_address
+        msg["From"]      = f"{sender_display} <{self.mailbox.email_address}>"
+        msg["To"]        = to_email
+        msg["Subject"]   = random.choice(WARMUP_SUBJECTS)
+        msg["X-Mailer"]  = random.choice(["Microsoft Outlook 16.0", "Apple Mail", "Gmail", "Thunderbird"])
+        msg["X-Priority"] = "3"
+        first_name    = self._first_name(to_name, to_email)
+        body_template = random.choice(WARMUP_BODIES)
+        body = body_template.format(name=first_name)
+        signature = self._sender_signature()
+        body = body.rstrip() + f"\n\n— {signature}"
+        msg.attach(MIMEText(body, "plain"))
+        return msg
+
+    # ── Gmail API: Send warmup email ─────────────────────────────────────────
+    def _send_via_gmail_api(self, to_email: str, to_name: Optional[str] = None) -> bool:
+        """Send email using Gmail API (HTTPS) — works on Railway, no SMTP needed."""
         try:
-            import time
+            import json, base64
+            from google.oauth2.credentials import Credentials
+            from google.auth.transport.requests import Request
+            from googleapiclient.discovery import build
+            from services.encryption import decrypt_password as _dec
 
-            msg = MIMEMultipart("alternative")
-            sender_display = self.mailbox.display_name or self.mailbox.email_address
-            msg["From"]     = f"{sender_display} <{self.mailbox.email_address}>"
-            msg["To"]       = to_email
-            msg["Subject"]  = random.choice(WARMUP_SUBJECTS)
-            msg["X-Mailer"] = random.choice([
-                "Microsoft Outlook 16.0",
-                "Apple Mail",
-                "Gmail",
-                "Thunderbird",
-            ])
-            msg["X-Priority"] = "3"
+            token_data = json.loads(_dec(self.mailbox.oauth_refresh_token_enc))
+            creds = Credentials(
+                token=None,
+                refresh_token=token_data["refresh_token"],
+                client_id=token_data["client_id"],
+                client_secret=token_data["client_secret"],
+                token_uri="https://oauth2.googleapis.com/token",
+                scopes=["https://www.googleapis.com/auth/gmail.send"],
+            )
+            creds.refresh(Request())
 
-            # Fill recipient first name into body
-            first_name  = self._first_name(to_name, to_email)
-            body_template = random.choice(WARMUP_BODIES)
-            body = body_template.format(name=first_name)
+            service = build("gmail", "v1", credentials=creds)
+            msg = self._build_mime_message(to_email, to_name)
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+            service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
-            # Append sender first name as sign-off
-            signature = self._sender_signature()
-            body = body.rstrip() + f"\n\n— {signature}"
+            logger.info(f"✅ Gmail API sent: {self.mailbox.email_address} → {to_email}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Gmail API error ({self.mailbox.email_address}): {e}")
+            return False
 
-            msg.attach(MIMEText(body, "plain"))
+    # ── SMTP: Send warmup email ──────────────────────────────────────────────
+    def _send_via_smtp(self, to_email: str, to_name: Optional[str] = None) -> bool:
+        """Send a single warmup email via SMTP."""
+        try:
+            msg = self._build_mime_message(to_email, to_name)
 
             if self.mailbox.smtp_use_tls:
                 server = smtplib.SMTP(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
@@ -342,12 +373,21 @@ class EmailService:
             server.sendmail(self.mailbox.email_address, to_email, msg.as_string())
             server.quit()
 
-            logger.info(f"✅ Sent warmup: {self.mailbox.email_address} → {to_email}")
+            logger.info(f"✅ SMTP sent: {self.mailbox.email_address} → {to_email}")
             return True
-
         except Exception as e:
             logger.error(f"❌ SMTP error ({self.mailbox.email_address}): {e}")
             return False
+
+    # ── Smart dispatch ───────────────────────────────────────────────────────
+    def send_warmup_email(self, to_email: str, to_name: Optional[str] = None) -> bool:
+        """Send warmup email — uses Gmail API if configured, else SMTP."""
+        auth_type = getattr(self.mailbox, "auth_type", "smtp") or "smtp"
+        if auth_type == "gmail_api":
+            return self._send_via_gmail_api(to_email, to_name)
+        return self._send_via_smtp(to_email, to_name)
+
+
 
     # ── IMAP: Open unread warmup emails ─────────────────────────────────────
     def open_warmup_emails(self) -> int:
