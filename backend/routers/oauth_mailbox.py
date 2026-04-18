@@ -72,38 +72,40 @@ def get_google_auth_url(
     return {"auth_url": auth_url}
 
 
-# ── Step 2: Exchange code for tokens ──────────────────────────────────────────
-class GoogleCallbackPayload(BaseModel):
-    code: str
-    mailbox_id: str
-
-
-@router.post("/google-callback")
+# ── Step 2: Exchange code for tokens (Google redirects here) ──────────────────
+@router.get("/google-callback")
 def google_callback(
-    payload: GoogleCallbackPayload,
+    code: str,
+    state: str,   # mailbox_id passed as 'state' param
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    error: str = None,
 ):
     """
-    Exchange the Google auth code for tokens and save the refresh token
-    (encrypted) to the mailbox. Sets auth_type = 'gmail_api'.
+    Google redirects here after user authorizes.
+    Exchanges auth code for tokens → saves encrypted refresh token to mailbox.
+    Then redirects back to the frontend.
     """
-    mailbox = db.query(Mailbox).filter(Mailbox.id == payload.mailbox_id).first()
+    from fastapi.responses import RedirectResponse
+
+    frontend_url = settings.frontend_url.rstrip("/")
+
+    if error:
+        return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error={error}")
+
+    mailbox = db.query(Mailbox).filter(Mailbox.id == state).first()
     if not mailbox:
-        raise HTTPException(status_code=404, detail="Mailbox not found")
+        return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=mailbox_not_found")
 
     try:
         flow = _google_flow()
-        flow.fetch_token(code=payload.code)
+        flow.fetch_token(code=code)
         creds = flow.credentials
 
         if not creds.refresh_token:
-            raise HTTPException(
-                status_code=400,
-                detail="No refresh token returned. Please revoke access in your Google account and try again."
+            return RedirectResponse(
+                f"{frontend_url}/mailboxes?oauth_error=no_refresh_token"
             )
 
-        # Store encrypted refresh token
         token_data = json.dumps({
             "refresh_token": creds.refresh_token,
             "client_id":     settings.google_client_id,
@@ -111,17 +113,16 @@ def google_callback(
         })
         mailbox.oauth_refresh_token_enc = encrypt_password(token_data)
         mailbox.auth_type = "gmail_api"
-
-        # SMTP fields not needed for Gmail API — clear them
-        mailbox.smtp_host = "smtp.gmail.com"  # kept for reference
+        mailbox.smtp_host = "smtp.gmail.com"
         mailbox.smtp_port = 587
-
         db.commit()
-        logger.info(f"✅ Gmail API connected for mailbox: {mailbox.email_address}")
-        return {"status": "connected", "email": mailbox.email_address, "auth_type": "gmail_api"}
 
-    except HTTPException:
-        raise
+        logger.info(f"✅ Gmail API connected: {mailbox.email_address}")
+        return RedirectResponse(
+            f"{frontend_url}/mailboxes?oauth_success={mailbox.email_address}"
+        )
+
     except Exception as e:
         logger.error(f"❌ Google OAuth callback error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"OAuth error: {str(e)}")
+        return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=token_exchange_failed")
+

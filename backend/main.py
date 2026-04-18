@@ -72,6 +72,26 @@ def seed_super_admin():
         db.close()
 
 
+def run_db_migrations():
+    """Safely add new columns to existing tables (PostgreSQL ALTER TABLE IF NOT EXISTS)."""
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        migrations = [
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auth_type VARCHAR(32) DEFAULT 'smtp'",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS oauth_refresh_token_enc TEXT",
+        ]
+        for sql in migrations:
+            db.execute(text(sql))
+        db.commit()
+        logger.info("✅ DB migrations applied")
+    except Exception as e:
+        logger.warning(f"⚠️ Migration note (may be harmless): {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup + shutdown lifecycle."""
@@ -79,6 +99,8 @@ async def lifespan(app: FastAPI):
     # Create tables
     create_tables()
     logger.info("✅ Database tables ready")
+    # Run safe column migrations
+    run_db_migrations()
     # Seed super admin
     seed_super_admin()
     # Start scheduler
@@ -90,6 +112,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("🔴 Shutting down...")
     stop_scheduler()
+
 
 
 app = FastAPI(
