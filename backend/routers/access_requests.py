@@ -107,8 +107,12 @@ def approve_access_request(
     req = db.query(AccessRequest).filter(AccessRequest.id == request_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Request not found")
+
+    # If already approved, only block if the company + user actually exist
     if req.is_approved:
-        raise HTTPException(status_code=400, detail="Already approved")
+        existing_user = db.query(User).filter(User.email == req.email).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Already approved — company and user already exist")
 
     # Generate a unique slug from company name
     base_slug = re.sub(r"[^a-z0-9]", "-", req.company_name.lower()).strip("-")
