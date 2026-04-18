@@ -241,3 +241,29 @@ def test_connections(
         "imap": {"success": imap_ok, "message": imap_msg},
         "overall": smtp_ok and imap_ok,
     }
+
+
+# ── Temporary send test ───────────────────────────────────────────────────────
+@router.get("/{mailbox_id}/trigger-test")
+def trigger_send_test(
+    mailbox_id: str,
+    db: Session = Depends(get_db),
+):
+    """Temporary endpoint to forcefully send an email (tests Gmail API bypass)."""
+    mailbox = db.query(Mailbox).filter(Mailbox.id == mailbox_id).first()
+    if not mailbox:
+        raise HTTPException(status_code=404, detail="Mailbox not found")
+
+    svc = EmailService(db)
+    success = svc.send_warmup_email(
+        from_mailbox=mailbox,
+        to_email=mailbox.email_address,  # Send to itself for a quick test
+        subject="🚀 Railway Gmail API Bypass Test",
+        body="If you receive this, the OAuth token exchange and Gmail API sending works perfectly!"
+    )
+    
+    return {
+        "success": success, 
+        "auth_type": mailbox.auth_type, 
+        "sent_to": mailbox.email_address
+    }
