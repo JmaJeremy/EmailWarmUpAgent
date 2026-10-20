@@ -1,29 +1,34 @@
 """
-OAuth Mailbox Router — Gmail API OAuth2 authorization flow.
+OAuth Mailbox Router — Google (Gmail API) and Microsoft (Graph) authorization flows.
 
 Endpoints:
-  GET  /mailboxes/oauth/google-url        → returns Google OAuth consent URL
-  POST /mailboxes/oauth/google-callback   → exchanges auth code for tokens + saves to mailbox
+  GET  /mailboxes/oauth/google-url           → returns Google OAuth consent URL
+  GET  /mailboxes/oauth/google-callback      → exchanges auth code for tokens + saves to mailbox
+  GET  /mailboxes/oauth/microsoft-url        → returns Microsoft sign-in URL
+  GET  /mailboxes/oauth/microsoft-callback   → exchanges auth code for tokens + saves to mailbox
 """
 import json
 import logging
+import urllib.parse
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import RedirectResponse
+from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from database import SessionLocal
 from models.mailbox import Mailbox
+from models.user import User, UserRole
 from config import settings
-from dependencies import get_current_user
+from dependencies import require_admin
 from services.encryption import encrypt_password, decrypt_password
+from services import microsoft_graph
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mailboxes/oauth", tags=["Mailbox OAuth"])
 
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.modify",
-]
+# Full mail scope: Gmail API sending + IMAP (XOAUTH2) reading/flagging/moving
+GOOGLE_SCOPES = ["https://mail.google.com/"]
 
 
 def get_db():
@@ -52,20 +57,48 @@ def _google_flow():
     return flow
 
 
+def _make_state(mailbox_id: str, provider: str) -> str:
+    """Signed, short-lived state so the callback can trust which mailbox it is for."""
+    return jwt.encode(
+        {"mid": mailbox_id, "prv": provider, "exp": datetime.utcnow() + timedelta(minutes=15)},
+        settings.jwt_secret_key, algorithm=settings.jwt_algorithm,
+    )
+
+
+def _read_state(state: str, provider: str):
+    try:
+        payload = jwt.decode(state, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        return None
+    return payload.get("mid") if payload.get("prv") == provider else None
+
+
+def _owned_mailbox(db: Session, mailbox_id: str, user: User) -> Mailbox:
+    mailbox = db.query(Mailbox).filter(Mailbox.id == mailbox_id).first()
+    if not mailbox or (user.role != UserRole.super_admin and mailbox.company_id != user.company_id):
+        raise HTTPException(status_code=404, detail="Mailbox not found")
+    return mailbox
+
+
+def _back_to_frontend(**params) -> RedirectResponse:
+    return RedirectResponse(f"{settings.frontend_url.rstrip('/')}/mailboxes?" + urllib.parse.urlencode(params))
+
+
 # ── Step 1: Get consent URL ───────────────────────────────────────────────────
 @router.get("/google-url")
 def get_google_auth_url(
     mailbox_id: str,
-    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
 ):
     """Return the Google OAuth consent URL for a specific mailbox."""
     if not settings.google_client_id or not settings.google_client_secret:
         raise HTTPException(status_code=501, detail="Google OAuth not configured in environment variables")
+    _owned_mailbox(db, mailbox_id, current_user)
 
     logger.info(f"🔑 Google OAuth URL requested for mailbox: {mailbox_id}")
     logger.info(f"   redirect_uri: {settings.google_redirect_uri}")
 
-    import urllib.parse
     # Build auth URL manually — no PKCE code_challenge (google_auth_oauthlib adds it automatically)
     params = {
         "client_id":              settings.google_client_id,
@@ -75,7 +108,7 @@ def get_google_auth_url(
         "access_type":            "offline",
         "include_granted_scopes": "true",
         "prompt":                 "consent",
-        "state":                  mailbox_id,
+        "state":                  _make_state(mailbox_id, "google"),
     }
     auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
     return {"auth_url": auth_url}
@@ -84,8 +117,8 @@ def get_google_auth_url(
 # ── Step 2: Exchange code for tokens (Google redirects here) ──────────────────
 @router.get("/google-callback")
 def google_callback(
-    code: str,
-    state: str,   # mailbox_id passed as 'state' param
+    state: str,   # signed mailbox_id
+    code: str = None,
     db: Session = Depends(get_db),
     error: str = None,
 ):
@@ -94,14 +127,13 @@ def google_callback(
     Exchanges auth code for tokens → saves encrypted refresh token to mailbox.
     Then redirects back to the frontend.
     """
-    from fastapi.responses import RedirectResponse
-
     frontend_url = settings.frontend_url.rstrip("/")
 
     if error:
-        return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error={error}")
+        return _back_to_frontend(oauth_error=error)
 
-    mailbox = db.query(Mailbox).filter(Mailbox.id == state).first()
+    mailbox_id = _read_state(state, "google")
+    mailbox = db.query(Mailbox).filter(Mailbox.id == mailbox_id).first() if mailbox_id else None
     if not mailbox:
         return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=mailbox_not_found")
 
@@ -156,3 +188,60 @@ def google_callback(
         logger.error(f"❌ Google OAuth callback error: {type(e).__name__}: {e}", exc_info=True)
         return RedirectResponse(f"{frontend_url}/mailboxes?oauth_error=token_exchange_failed&detail={error_detail}")
 
+
+
+# ── Microsoft 365 / Exchange Online ───────────────────────────────────────────
+@router.get("/microsoft-url")
+def get_microsoft_auth_url(
+    mailbox_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Return the Microsoft sign-in URL for a specific mailbox."""
+    if not microsoft_graph.is_configured():
+        raise HTTPException(
+            status_code=501,
+            detail="Microsoft OAuth not configured — set MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET and MICROSOFT_TENANT_ID",
+        )
+    mailbox = _owned_mailbox(db, mailbox_id, current_user)
+    return {"auth_url": microsoft_graph.build_auth_url(_make_state(mailbox.id, "microsoft"), mailbox.email_address)}
+
+
+@router.get("/microsoft-callback")
+def microsoft_callback(
+    state: str,
+    code: str = None,
+    error: str = None,
+    error_description: str = None,
+    db: Session = Depends(get_db),
+):
+    """Microsoft redirects here after sign-in → store the encrypted refresh token on the mailbox."""
+    if error:
+        return _back_to_frontend(oauth_error=error, detail=(error_description or "")[:200])
+
+    mailbox_id = _read_state(state, "microsoft")
+    mailbox = db.query(Mailbox).filter(Mailbox.id == mailbox_id).first() if mailbox_id else None
+    if not mailbox or not code:
+        return _back_to_frontend(oauth_error="mailbox_not_found")
+
+    try:
+        tokens = microsoft_graph.exchange_code(code)
+        if not tokens.get("refresh_token"):
+            return _back_to_frontend(oauth_error="no_refresh_token")
+
+        me = microsoft_graph.get_me(tokens["access_token"])
+        signed_in = (me.get("mail") or me.get("userPrincipalName") or "").lower()
+        if signed_in != mailbox.email_address.lower():
+            return _back_to_frontend(
+                oauth_error="wrong_account",
+                detail=f"Signed in as {signed_in}, but this mailbox is {mailbox.email_address}",
+            )
+
+        mailbox.oauth_refresh_token_enc = microsoft_graph.encode_token_blob(tokens["refresh_token"])
+        mailbox.auth_type = "microsoft_graph"
+        db.commit()
+        logger.info(f"✅ Microsoft Graph connected: {mailbox.email_address}")
+        return _back_to_frontend(oauth_success=mailbox.email_address)
+    except Exception as e:
+        logger.error(f"❌ Microsoft OAuth callback error: {type(e).__name__}: {e}", exc_info=True)
+        return _back_to_frontend(oauth_error="token_exchange_failed", detail=str(e)[:200])

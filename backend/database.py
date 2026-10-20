@@ -1,6 +1,6 @@
 """
 NeuroGenix WarmUp — Database Configuration
-SQLAlchemy setup with SQLite (local) / PostgreSQL (Railway) support
+SQLAlchemy setup with SQLite (local) / PostgreSQL support
 """
 import os
 from sqlalchemy import create_engine, event
@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./neurogenix_warmup.db")
+# Pin the installed driver (psycopg2) — newer SQLAlchemy defaults bare postgresql:// to psycopg 3
+for _prefix in ("postgres://", "postgresql://"):
+    if DATABASE_URL.startswith(_prefix):
+        DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len(_prefix):]
 
 # SQLite-specific: enable WAL mode for concurrent access
 connect_args = {}
