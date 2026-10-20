@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     google_client_secret: str = ""  # needed for Gmail API OAuth token exchange
     google_redirect_uri: str = "http://localhost:8000/mailboxes/oauth/google-callback"
 
+    # Microsoft 365 / Exchange Online OAuth (Entra ID app registration)
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""
+    microsoft_tenant_id: str = ""
+    # Defaults to {FRONTEND_URL}/api/mailboxes/oauth/microsoft-callback (the Docker/nginx layout)
+    microsoft_redirect_uri: str = ""
+
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -50,6 +57,8 @@ def get_settings() -> Settings:
     s = Settings()
     if s.database_url and s.database_url.startswith("postgres://"):
         s.database_url = s.database_url.replace("postgres://", "postgresql://", 1)
+    if not s.microsoft_redirect_uri:
+        s.microsoft_redirect_uri = f"{s.frontend_url.rstrip('/')}/api/mailboxes/oauth/microsoft-callback"
     return s
 
 

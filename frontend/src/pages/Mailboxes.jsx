@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { createPortal } from 'react-dom'
+import { useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { mailboxApi, warmupApi } from '../api/client'
 import {
@@ -52,6 +53,7 @@ function MailboxCard({ mailbox, onRefresh }) {
   const [newLimit, setNewLimit] = useState(mailbox.daily_limit || 3)
 
   const weekLimit = mailbox.daily_limit || 3
+  const needsMicrosoftConnect = mailbox.auth_type === 'microsoft_graph' && !mailbox.oauth_connected
   const progressPct = Math.round((mailbox.current_week / 8) * 100)
 
   const handleStart = async () => {
@@ -154,6 +156,13 @@ function MailboxCard({ mailbox, onRefresh }) {
           ))}
         </div>
 
+        {needsMicrosoftConnect && (
+          <div className="mb-3 p-3 rounded-xl bg-orange/10 border border-orange/20 text-xs text-orange space-y-2">
+            <p>Not connected yet — sign in with this Microsoft 365 account before starting warmup.</p>
+            <ConnectMicrosoftButton mailboxId={mailbox.id} />
+          </div>
+        )}
+
         {/* Actions */}
         <div className="flex items-center gap-2">
           {mailbox.warmup_status === 'active' ? (
@@ -161,7 +170,7 @@ function MailboxCard({ mailbox, onRefresh }) {
               <Pause className="w-3.5 h-3.5" /> Pause
             </button>
           ) : mailbox.warmup_status !== 'completed' ? (
-            <button id={`start-${mailbox.id}`} onClick={handleStart} disabled={loading} className="btn-primary flex-1 text-xs py-2">
+            <button id={`start-${mailbox.id}`} onClick={handleStart} disabled={loading || needsMicrosoftConnect} className="btn-primary flex-1 text-xs py-2">
               <Play className="w-3.5 h-3.5" /> Start Warmup
             </button>
           ) : (
@@ -183,12 +192,12 @@ function MailboxCard({ mailbox, onRefresh }) {
           <div className={`mt-3 p-3 rounded-xl border text-xs space-y-1 ${testResult.overall ? 'bg-green/10 border-green/20' : 'bg-red-500/10 border-red-500/20'}`}>
             <div className="flex items-center gap-2">
               {testResult.smtp?.success ? <CheckCircle className="w-3.5 h-3.5 text-green" /> : <AlertCircle className="w-3.5 h-3.5 text-red-400" />}
-              <span className="text-text-secondary">SMTP:</span>
+              <span className="text-text-secondary">Send:</span>
               <span className={testResult.smtp?.success ? 'text-green' : 'text-red-400'}>{testResult.smtp?.message}</span>
             </div>
             <div className="flex items-center gap-2">
               {testResult.imap?.success ? <CheckCircle className="w-3.5 h-3.5 text-green" /> : <AlertCircle className="w-3.5 h-3.5 text-red-400" />}
-              <span className="text-text-secondary">IMAP:</span>
+              <span className="text-text-secondary">Read:</span>
               <span className={testResult.imap?.success ? 'text-green' : 'text-red-400'}>{testResult.imap?.message}</span>
             </div>
           </div>
@@ -197,25 +206,33 @@ function MailboxCard({ mailbox, onRefresh }) {
         {/* Expanded */}
         {expanded && (
           <div className="mt-3 pt-3 border-t border-border text-xs space-y-1.5">
-            <div className="flex justify-between"><span className="text-text-muted">SMTP</span><span className="text-text-secondary">{mailbox.smtp_host}:{mailbox.smtp_port}</span></div>
-            <div className="flex justify-between"><span className="text-text-muted">IMAP</span><span className="text-text-secondary">{mailbox.imap_host}:{mailbox.imap_port}</span></div>
+            {mailbox.auth_type !== 'microsoft_graph' && (<>
+              <div className="flex justify-between"><span className="text-text-muted">SMTP</span><span className="text-text-secondary">{mailbox.smtp_host}:{mailbox.smtp_port}</span></div>
+              <div className="flex justify-between"><span className="text-text-muted">IMAP</span><span className="text-text-secondary">{mailbox.imap_host}:{mailbox.imap_port}</span></div>
+            </>)}
             {/* Auth type badge */}
             <div className="flex justify-between items-center pt-1">
               <span className="text-text-muted">Send via</span>
               {mailbox.auth_type === 'gmail_api'
                 ? <span className="px-2 py-0.5 rounded-full bg-green/10 border border-green/20 text-green text-[10px] font-bold">✅ Gmail API</span>
+                : mailbox.auth_type === 'microsoft_graph'
+                ? <span className="px-2 py-0.5 rounded-full bg-blue-accent/10 border border-blue-accent/20 text-blue-400 text-[10px] font-bold">{mailbox.oauth_connected ? '✅ Microsoft Graph' : 'Microsoft Graph (not connected)'}</span>
                 : <span className="px-2 py-0.5 rounded-full bg-orange/10 border border-orange/20 text-orange text-[10px] font-bold">SMTP</span>
               }
             </div>
-            {/* Connect with Google — show if not yet connected */}
-            {mailbox.auth_type !== 'gmail_api' && (
+            {/* Reconnect Microsoft (e.g. after a password change or revoked consent) */}
+            {mailbox.auth_type === 'microsoft_graph' && mailbox.oauth_connected && (
+              <ConnectMicrosoftButton mailboxId={mailbox.id} label="Reconnect Microsoft account" />
+            )}
+            {/* Connect with Google — only offered for Gmail mailboxes not yet on the Gmail API */}
+            {mailbox.auth_type === 'smtp' && mailbox.smtp_host === 'smtp.gmail.com' && (
               <button
                 onClick={async () => {
                   try {
                     const { data } = await api.get(`/mailboxes/oauth/google-url?mailbox_id=${mailbox.id}`)
                     window.location.href = data.auth_url
                   } catch (e) {
-                    alert('Could not get Google auth URL. Check GOOGLE_CLIENT_SECRET is set in Railway.')
+                    alert(e.response?.data?.detail || 'Could not get Google auth URL. Check GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are set.')
                   }
                 }}
                 className="w-full mt-2 flex items-center justify-center gap-2 py-2 rounded-xl border border-white/10 bg-white text-gray-700 text-xs font-semibold hover:bg-gray-50 transition-colors"
@@ -232,7 +249,29 @@ function MailboxCard({ mailbox, onRefresh }) {
   )
 }
 
+async function startMicrosoftConnect(mailboxId) {
+  try {
+    const { data } = await api.get(`/mailboxes/oauth/microsoft-url?mailbox_id=${mailboxId}`)
+    window.location.href = data.auth_url
+  } catch (e) {
+    alert(e.response?.data?.detail || 'Could not get Microsoft sign-in URL.')
+  }
+}
+
+function ConnectMicrosoftButton({ mailboxId, label = 'Connect with Microsoft' }) {
+  return (
+    <button
+      onClick={() => startMicrosoftConnect(mailboxId)}
+      className="w-full mt-2 flex items-center justify-center gap-2 py-2 rounded-xl border border-white/10 bg-white text-gray-700 text-xs font-semibold hover:bg-gray-50 transition-colors"
+    >
+      <svg width="14" height="14" viewBox="0 0 21 21"><rect x="1" y="1" width="9" height="9" fill="#F25022"/><rect x="11" y="1" width="9" height="9" fill="#7FBA00"/><rect x="1" y="11" width="9" height="9" fill="#00A4EF"/><rect x="11" y="11" width="9" height="9" fill="#FFB900"/></svg>
+      {label}
+    </button>
+  )
+}
+
 function AddMailboxModal({ onClose, onAdded }) {
+  const [mode, setMode] = useState('smtp') // smtp | microsoft_graph
   const [form, setForm] = useState({
     email_address: '', display_name: '',
     smtp_host: '', smtp_port: 587, smtp_user: '', smtp_password: '', smtp_use_tls: true,
@@ -242,23 +281,41 @@ function AddMailboxModal({ onClose, onAdded }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  // Auto-fill common providers
+  // Auto-fill common providers (all use app passwords / regular passwords over SMTP + IMAP)
   const presets = {
-    Gmail: { smtp_host: 'smtp.gmail.com', smtp_port: 587, imap_host: 'imap.gmail.com', imap_port: 993 },
-    Outlook: { smtp_host: 'smtp.office365.com', smtp_port: 587, imap_host: 'outlook.office365.com', imap_port: 993 },
-    Yahoo: { smtp_host: 'smtp.mail.yahoo.com', smtp_port: 587, imap_host: 'imap.mail.yahoo.com', imap_port: 993 },
+    Gmail:      { smtp_host: 'smtp.gmail.com',       smtp_port: 587, imap_host: 'imap.gmail.com',       imap_port: 993 },
+    Purelymail: { smtp_host: 'smtp.purelymail.com',  smtp_port: 587, imap_host: 'imap.purelymail.com',  imap_port: 993 },
+    Fastmail:   { smtp_host: 'smtp.fastmail.com',    smtp_port: 587, imap_host: 'imap.fastmail.com',    imap_port: 993 },
+    Zoho:       { smtp_host: 'smtp.zoho.com',        smtp_port: 587, imap_host: 'imap.zoho.com',        imap_port: 993 },
+    iCloud:     { smtp_host: 'smtp.mail.me.com',     smtp_port: 587, imap_host: 'imap.mail.me.com',     imap_port: 993 },
+    Yahoo:      { smtp_host: 'smtp.mail.yahoo.com',  smtp_port: 587, imap_host: 'imap.mail.yahoo.com',  imap_port: 993 },
   }
 
-  const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
-  const applyPreset = (p) => setForm(f => ({ ...f, ...presets[p] }))
+  // Port 465 = implicit TLS; anything else = STARTTLS
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v, ...(k === 'smtp_port' ? { smtp_use_tls: Number(v) !== 465 } : {}) }))
+  const applyPreset = (p) => setForm(f => ({ ...f, ...presets[p], smtp_use_tls: presets[p].smtp_port !== 465 }))
+  // Most providers use the email address as the login — fill it in unless the user typed something else
+  const setEmail = (v) => setForm(f => ({
+    ...f, email_address: v,
+    smtp_user: !f.smtp_user || f.smtp_user === f.email_address ? v : f.smtp_user,
+    imap_user: !f.imap_user || f.imap_user === f.email_address ? v : f.imap_user,
+  }))
 
   const submit = async (e) => {
     e.preventDefault(); setError(''); setLoading(true)
     try {
-      await mailboxApi.add({ ...form, smtp_port: Number(form.smtp_port), imap_port: Number(form.imap_port) })
+      if (mode === 'microsoft_graph') {
+        const { data } = await mailboxApi.add({
+          email_address: form.email_address, display_name: form.display_name, auth_type: 'microsoft_graph',
+        })
+        await startMicrosoftConnect(data.mailbox.id)  // leaves the page for Microsoft sign-in
+        return
+      }
+      await mailboxApi.add({ ...form, auth_type: 'smtp', smtp_port: Number(form.smtp_port), imap_port: Number(form.imap_port) })
       onAdded()
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to add mailbox')
+      const detail = err.response?.data?.detail
+      setError(typeof detail === 'string' ? detail : 'Failed to add mailbox')
     } finally { setLoading(false) }
   }
 
@@ -269,7 +326,9 @@ function AddMailboxModal({ onClose, onAdded }) {
           <div className="flex items-center justify-between p-6 border-b border-border">
             <div>
               <h2 className="text-lg font-bold text-white">Add Mailbox</h2>
-              <p className="text-xs text-text-secondary mt-0.5">Configure SMTP + IMAP credentials for warmup</p>
+              <p className="text-xs text-text-secondary mt-0.5">
+                {mode === 'microsoft_graph' ? 'Sign in with Microsoft 365 after adding' : 'Configure SMTP + IMAP credentials for warmup'}
+              </p>
             </div>
             <button onClick={onClose} className="text-text-muted hover:text-white transition-colors">
               <X className="w-5 h-5" />
@@ -283,10 +342,28 @@ function AddMailboxModal({ onClose, onAdded }) {
               </div>
             )}
 
-            {/* Quick presets */}
+            {/* Connection type */}
             <div>
+              <p className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">Connection Type</p>
+              <div className="grid grid-cols-2 gap-2">
+                {[
+                  { id: 'smtp', title: 'SMTP + IMAP', desc: 'Gmail (app password), Purelymail, Fastmail, Zoho, …' },
+                  { id: 'microsoft_graph', title: 'Microsoft 365', desc: 'Exchange Online / Outlook — sign in with Microsoft' },
+                ].map(o => (
+                  <button key={o.id} type="button" onClick={() => setMode(o.id)}
+                    className={clsx('p-3 rounded-xl border text-left transition-all',
+                      mode === o.id ? 'border-orange bg-orange/10' : 'border-border bg-bg-elevated hover:border-orange/40')}>
+                    <p className="text-sm font-semibold text-white">{o.title}</p>
+                    <p className="text-[11px] text-text-muted mt-0.5">{o.desc}</p>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Quick presets */}
+            {mode === 'smtp' && <div>
               <p className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">Quick Presets</p>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 {Object.keys(presets).map(p => (
                   <button key={p} type="button" onClick={() => applyPreset(p)}
                     className="px-3 py-1.5 rounded-lg bg-bg-elevated border border-border text-xs text-text-secondary hover:text-white hover:border-orange/40 transition-all">
@@ -294,13 +371,13 @@ function AddMailboxModal({ onClose, onAdded }) {
                   </button>
                 ))}
               </div>
-            </div>
+            </div>}
 
             {/* Identity */}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs font-semibold text-text-secondary uppercase tracking-wider mb-1.5">Email Address *</label>
-                <input required value={form.email_address} onChange={e => set('email_address', e.target.value)}
+                <input required value={form.email_address} onChange={e => setEmail(e.target.value)}
                   placeholder="you@domain.com" className="input-field" type="email" />
               </div>
               <div>
@@ -310,6 +387,14 @@ function AddMailboxModal({ onClose, onAdded }) {
               </div>
             </div>
 
+            {mode === 'microsoft_graph' && (
+              <div className="p-4 rounded-xl bg-bg-elevated border border-border text-xs text-text-secondary space-y-1">
+                <p>After you click <strong className="text-white">Add &amp; Connect</strong>, you'll be sent to Microsoft to sign in as this mailbox and approve access.</p>
+                <p className="text-text-muted">Sending, reading and Junk-folder rescue all go through Microsoft Graph — no SMTP AUTH or IMAP needed.</p>
+              </div>
+            )}
+
+            {mode === 'smtp' && <>
             {/* SMTP */}
             <div className="p-4 rounded-xl bg-bg-elevated border border-border space-y-3">
               <p className="text-xs font-bold text-orange uppercase tracking-wider">SMTP — Sending</p>
@@ -381,11 +466,12 @@ function AddMailboxModal({ onClose, onAdded }) {
                 </div>
               </div>
             </div>
+            </>}
 
             <div className="flex gap-3 pt-1">
               <button type="button" onClick={onClose} className="btn-secondary flex-1">Cancel</button>
               <button id="add-mailbox-submit" type="submit" disabled={loading} className="btn-primary flex-1">
-                {loading ? 'Adding...' : 'Add Mailbox'}
+                {loading ? 'Adding...' : mode === 'microsoft_graph' ? 'Add & Connect' : 'Add Mailbox'}
               </button>
             </div>
           </form>
@@ -549,6 +635,17 @@ export default function Mailboxes() {
   const [loading, setLoading]     = useState(true)
   const [showModal, setShowModal] = useState(false)
   const [running, setRunning]     = useState(false)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [oauthResult] = useState(() => {
+    const ok = searchParams.get('oauth_success')
+    const err = searchParams.get('oauth_error')
+    if (ok) return { ok: true, text: `Connected ${ok}` }
+    if (err) return { ok: false, text: `Connection failed: ${err}${searchParams.get('detail') ? ` — ${searchParams.get('detail')}` : ''}` }
+    return null
+  })
+
+  // Clear the OAuth query params once read so a refresh doesn't show the banner again
+  useEffect(() => { if (oauthResult) setSearchParams({}, { replace: true }) }, [])
 
   const load = async () => {
     setLoading(true)
@@ -590,6 +687,14 @@ export default function Mailboxes() {
           </button>
         </div>
       </div>
+
+      {oauthResult && (
+        <div className={clsx('p-4 rounded-xl border flex items-start gap-3 text-sm',
+          oauthResult.ok ? 'bg-green/10 border-green/20 text-green' : 'bg-red-500/10 border-red-500/20 text-red-400')}>
+          {oauthResult.ok ? <CheckCircle className="w-4 h-4 flex-shrink-0 mt-0.5" /> : <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />}
+          <p>{oauthResult.text}</p>
+        </div>
+      )}
 
       {/* Info banner */}
       {mailboxes.length > 0 && active < 2 && (

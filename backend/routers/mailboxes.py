@@ -5,7 +5,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
-from typing import Optional
+from typing import Literal, Optional
 from database import get_db
 from models.mailbox import Mailbox, WarmupStatus
 from models.user import User, UserRole
@@ -20,17 +20,19 @@ router = APIRouter(prefix="/mailboxes", tags=["Mailboxes"])
 class MailboxCreate(BaseModel):
     email_address: EmailStr
     display_name: Optional[str] = None
+    # smtp (SMTP + IMAP credentials) | microsoft_graph (connect via Microsoft sign-in afterwards)
+    auth_type: Literal["smtp", "microsoft_graph"] = "smtp"
     # SMTP
-    smtp_host: str
+    smtp_host: Optional[str] = None
     smtp_port: int = 587
-    smtp_user: str
-    smtp_password: str
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
     smtp_use_tls: bool = True
     # IMAP
-    imap_host: str
+    imap_host: Optional[str] = None
     imap_port: int = 993
-    imap_user: str
-    imap_password: str
+    imap_user: Optional[str] = None
+    imap_password: Optional[str] = None
     imap_use_ssl: bool = True
 
 
@@ -47,7 +49,8 @@ def _mailbox_to_dict(m: Mailbox, include_creds: bool = False) -> dict:
         "company_id": m.company_id,
         "email_address": m.email_address,
         "display_name": m.display_name,
-        "auth_type": getattr(m, "auth_type", "smtp") or "smtp",  # gmail_api | smtp
+        "auth_type": getattr(m, "auth_type", "smtp") or "smtp",  # smtp | gmail_api | microsoft_graph
+        "oauth_connected": bool(m.oauth_refresh_token_enc),
         "smtp_host": m.smtp_host,
         "smtp_port": m.smtp_port,
         "smtp_user": m.smtp_user,
@@ -112,11 +115,24 @@ def add_mailbox(
     if existing:
         raise HTTPException(status_code=400, detail="Mailbox already added for this company")
 
+    if payload.auth_type == "microsoft_graph":
+        # Everything goes through Graph; the SMTP/IMAP columns are informational only
+        payload.smtp_host, payload.smtp_port, payload.smtp_use_tls = "smtp.office365.com", 587, True
+        payload.imap_host, payload.imap_port, payload.imap_use_ssl = "outlook.office365.com", 993, True
+        payload.smtp_user = payload.imap_user = payload.email_address
+        payload.smtp_password = payload.imap_password = ""
+    else:
+        missing = [f for f in ("smtp_host", "smtp_user", "smtp_password", "imap_host", "imap_user", "imap_password")
+                   if not getattr(payload, f)]
+        if missing:
+            raise HTTPException(status_code=422, detail=f"Missing fields: {', '.join(missing)}")
+
     mailbox = Mailbox(
         id=str(uuid.uuid4()),
         company_id=current_user.company_id,
         email_address=payload.email_address,
         display_name=payload.display_name or payload.email_address.split("@")[0],
+        auth_type=payload.auth_type,
         smtp_host=payload.smtp_host,
         smtp_port=payload.smtp_port,
         smtp_user=payload.smtp_user,
@@ -202,6 +218,8 @@ def start_warmup(
     mailbox = db.query(Mailbox).filter(Mailbox.id == mailbox_id).first()
     if not mailbox or mailbox.company_id != current_user.company_id:
         raise HTTPException(status_code=404, detail="Mailbox not found")
+    if mailbox.auth_type in ("microsoft_graph", "gmail_api") and not mailbox.oauth_refresh_token_enc:
+        raise HTTPException(status_code=400, detail="Connect this mailbox to its provider before starting warmup")
     mailbox.warmup_status = WarmupStatus.active
     db.commit()
     return {"message": f"Warmup started for {mailbox.email_address}"}
@@ -242,28 +260,3 @@ def test_connections(
         "overall": smtp_ok and imap_ok,
     }
 
-
-# ── Temporary send test ───────────────────────────────────────────────────────
-@router.get("/{mailbox_id}/trigger-test")
-def trigger_send_test(
-    mailbox_id: str,
-    db: Session = Depends(get_db),
-):
-    """Temporary endpoint to forcefully send an email (tests Gmail API bypass)."""
-    mailbox = db.query(Mailbox).filter(Mailbox.id == mailbox_id).first()
-    if not mailbox:
-        raise HTTPException(status_code=404, detail="Mailbox not found")
-
-    svc = EmailService(db)
-    success = svc.send_warmup_email(
-        from_mailbox=mailbox,
-        to_email=mailbox.email_address,  # Send to itself for a quick test
-        subject="🚀 Railway Gmail API Bypass Test",
-        body="If you receive this, the OAuth token exchange and Gmail API sending works perfectly!"
-    )
-    
-    return {
-        "success": success, 
-        "auth_type": mailbox.auth_type, 
-        "sent_to": mailbox.email_address
-    }

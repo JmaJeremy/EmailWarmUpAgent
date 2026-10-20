@@ -1,6 +1,16 @@
 """
-Email Service — SMTP sending + IMAP reading/replying
-Core of the warmup engine: sends real emails and auto-reads/replies via IMAP
+Email Service — sending + reading/replying for every supported provider
+Core of the warmup engine: sends real emails and auto-reads/replies to them.
+
+TRANSPORTS (chosen by mailbox.auth_type):
+  smtp             → SMTP send + IMAP read (Gmail app passwords, Purelymail, Fastmail, …)
+  gmail_api        → Gmail API send + IMAP read via XOAUTH2 (Google OAuth)
+  microsoft_graph  → Microsoft Graph for everything (Microsoft 365 / Exchange Online)
+
+WARMUP DETECTION:
+  Every warmup email (and every auto-reply) carries a signed X-Warmup-ID header.
+  Only messages with a valid signature are ever opened, rescued or replied to —
+  real mail is never touched, even if its subject happens to match a template.
 
 HUMAN-LIKE TEMPLATE LIBRARY:
   ✅ 50+ unique subjects (never repetitive)
@@ -13,14 +23,28 @@ HUMAN-LIKE TEMPLATE LIBRARY:
 import smtplib
 import imaplib
 import email
+import email.utils
+import hashlib
+import hmac
+import json
 import random
+import re
 import logging
+import time
+import uuid
+import base64
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
 from datetime import datetime
 from typing import Optional
+
+import httpx
+
+from config import settings
 from services.encryption import decrypt_password
+from services import microsoft_graph as graph
+
 
 logger = logging.getLogger(__name__)
 
@@ -280,18 +304,102 @@ WARMUP_REPLIES = [
 ]
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Warmup message identification
+# ─────────────────────────────────────────────────────────────────────────────
+WARMUP_HEADER = "X-Warmup-ID"
+
+
+def _warmup_signature(nonce: str) -> str:
+    return hmac.new(settings.encryption_key.encode(), nonce.encode(), hashlib.sha256).hexdigest()[:16]
+
+
+def new_warmup_id() -> str:
+    nonce = uuid.uuid4().hex
+    return f"{nonce}.{_warmup_signature(nonce)}"
+
+
+def is_warmup_id(value: Optional[str]) -> bool:
+    """True only for X-Warmup-ID values minted by this deployment."""
+    if not value:
+        return False
+    nonce, _, sig = value.strip().partition(".")
+    return bool(nonce and sig) and hmac.compare_digest(sig, _warmup_signature(nonce))
+
+
+def _decode_subject(raw: str) -> str:
+    parts = []
+    for text, charset in decode_header(raw or ""):
+        parts.append(text.decode(charset or "utf-8", errors="ignore") if isinstance(text, bytes) else text)
+    return "".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMAP helpers
+# ─────────────────────────────────────────────────────────────────────────────
+# imaplib doesn't know the MOVE extension (RFC 6851) — register it so mail.uid("MOVE", …) works
+imaplib.Commands.setdefault("MOVE", ("SELECTED",))
+
+# Used when the server doesn't advertise a \Junk special-use folder (RFC 6154)
+JUNK_FOLDER_FALLBACKS = [
+    "[Gmail]/Spam", "Junk", "Junk Email", "Junk E-mail", "Spam",
+    "INBOX.Junk", "INBOX.Spam", "INBOX/Junk", "INBOX/Spam", "Bulk Mail", "Bulk",
+]
+_LIST_RE = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?:"(?:[^"\\]|\\.)*"|NIL)\s+(?P<name>.+)$')
+_UID_RE = re.compile(rb"UID (\d+)")
+_HEADER_FIELDS = f"(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM REPLY-TO MESSAGE-ID REFERENCES {WARMUP_HEADER.upper()})])"
+
+
+def _imap_quote(name: str) -> str:
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def find_junk_folders(list_response: list) -> list:
+    """Pick the spam/junk folder(s) out of an IMAP LIST response."""
+    names, flagged = [], []
+    for raw in list_response or []:
+        if not isinstance(raw, bytes):
+            continue  # literal-encoded names — rare, skip
+        m = _LIST_RE.match(raw.decode(errors="ignore").strip())
+        if not m:
+            continue
+        name = m.group("name").strip()
+        if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
+            name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        flags = m.group("flags").lower()
+        if "\\noselect" in flags or "\\nonexistent" in flags:
+            continue
+        names.append(name)
+        if "\\junk" in flags:
+            flagged.append(name)
+    if flagged:
+        return flagged
+    by_lower = {n.lower(): n for n in names}
+    return [by_lower[f.lower()] for f in JUNK_FOLDER_FALLBACKS if f.lower() in by_lower]
+
+
 class EmailService:
-    """Handles email sending (SMTP or Gmail API) and IMAP reading for a single mailbox."""
+    """Sends, opens and replies to warmup email for a single mailbox, whatever its provider."""
 
     def __init__(self, mailbox):
         self.mailbox = mailbox
-        # Only decrypt SMTP password if the mailbox uses SMTP
-        if getattr(mailbox, 'auth_type', 'smtp') == 'smtp':
+        self.auth_type = getattr(mailbox, "auth_type", "smtp") or "smtp"
+        if self.auth_type == "smtp":
             self.smtp_password = decrypt_password(mailbox.smtp_password_enc) if mailbox.smtp_password_enc else ''
+            self.imap_password = decrypt_password(mailbox.imap_password_enc) if mailbox.imap_password_enc else ''
         else:
             self.smtp_password = ''
-        # IMAP password always needed (reading is always IMAP)
-        self.imap_password = decrypt_password(mailbox.imap_password_enc) if mailbox.imap_password_enc else ''
+            self.imap_password = ''
+        self._graph_client: Optional[graph.GraphMailbox] = None
+        self._google_token: Optional[str] = None
+        self._google_token_expires = 0.0
+
+    def _graph(self) -> graph.GraphMailbox:
+        if self._graph_client is None:
+            self._graph_client = graph.GraphMailbox(self.mailbox)
+        return self._graph_client
 
     def _first_name(self, display_name: Optional[str], email_addr: str) -> str:
         """Extract first name from display name or email prefix."""
@@ -305,6 +413,13 @@ class EmailService:
         first = name.strip().split()[0]
         return first
 
+    def _stamp(self, msg: MIMEMultipart) -> None:
+        """Headers shared by warmup emails and replies."""
+        domain = self.mailbox.email_address.rsplit("@", 1)[-1]
+        msg["Message-ID"] = email.utils.make_msgid(domain=domain)
+        msg["Date"] = email.utils.formatdate(localtime=True)
+        msg[WARMUP_HEADER] = new_warmup_id()
+
     # ── Shared: build MIME message ───────────────────────────────────────────
     def _build_mime_message(self, to_email: str, to_name: Optional[str]) -> MIMEMultipart:
         """Build the warmup MIME message (used by all send methods)."""
@@ -315,6 +430,7 @@ class EmailService:
         msg["Subject"]   = random.choice(WARMUP_SUBJECTS)
         msg["X-Mailer"]  = random.choice(["Microsoft Outlook 16.0", "Apple Mail", "Gmail", "Thunderbird"])
         msg["X-Priority"] = "3"
+        self._stamp(msg)
         first_name    = self._first_name(to_name, to_email)
         body_template = random.choice(WARMUP_BODIES)
         body = body_template.format(name=first_name)
@@ -323,244 +439,305 @@ class EmailService:
         msg.attach(MIMEText(body, "plain"))
         return msg
 
-    # ── Gmail API: Send warmup email ─────────────────────────────────────────
-    def _send_via_gmail_api(self, to_email: str, to_name: Optional[str] = None, msg: Optional[MIMEMultipart] = None) -> bool:
-        """Send email using Gmail API (HTTPS) — works on Railway, no SMTP needed."""
+    def _build_reply(self, to_addr: str, original_subject: str, message_id: str, references: str = "") -> MIMEMultipart:
+        reply = MIMEMultipart("alternative")
+        reply["From"]    = f"{self.mailbox.display_name or self.mailbox.email_address} <{self.mailbox.email_address}>"
+        reply["To"]      = to_addr
+        subject = original_subject or "No Subject"
+        reply["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        if message_id:
+            reply["In-Reply-To"] = message_id
+            reply["References"]  = f"{references} {message_id}".strip()
+        self._stamp(reply)
+        reply.attach(MIMEText(random.choice(WARMUP_REPLIES) + f"\n\n— {self._sender_signature()}", "plain"))
+        return reply
+
+    # ── Google OAuth (gmail_api mailboxes) ───────────────────────────────────
+    def _google_access_token(self) -> str:
+        if self._google_token and time.time() < self._google_token_expires - 60:
+            return self._google_token
+        blob = json.loads(decrypt_password(self.mailbox.oauth_refresh_token_enc))
+        resp = httpx.post("https://oauth2.googleapis.com/token", data={
+            "client_id":     blob.get("client_id") or settings.google_client_id,
+            "client_secret": blob.get("client_secret") or settings.google_client_secret,
+            "refresh_token": blob["refresh_token"],
+            "grant_type":    "refresh_token",
+        }, timeout=30)
+        data = resp.json()
+        if "access_token" not in data:
+            raise RuntimeError(data.get("error_description") or data.get("error") or f"HTTP {resp.status_code}")
+        self._google_token = data["access_token"]
+        self._google_token_expires = time.time() + int(data.get("expires_in", 3600))
+        return self._google_token
+
+    # ── Senders ──────────────────────────────────────────────────────────────
+    def _send_via_gmail_api(self, msg: MIMEMultipart) -> None:
+        """Send using the Gmail API (HTTPS) — for hosts that block outbound SMTP."""
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        resp = httpx.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={"Authorization": f"Bearer {self._google_access_token()}"},
+            json={"raw": raw},
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Gmail API {resp.status_code}: {resp.text[:300]}")
+
+    def _send_via_smtp(self, msg: MIMEMultipart, to_email: str) -> None:
+        if self.mailbox.smtp_use_tls:
+            server = smtplib.SMTP(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+        else:
+            server = smtplib.SMTP_SSL(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
         try:
-            import json, base64
-            from google.oauth2.credentials import Credentials
-            from google.auth.transport.requests import Request
-            from googleapiclient.discovery import build
-            from services.encryption import decrypt_password as _dec
-
-            token_data = json.loads(_dec(self.mailbox.oauth_refresh_token_enc))
-            creds = Credentials(
-                token=None,
-                refresh_token=token_data["refresh_token"],
-                client_id=token_data["client_id"],
-                client_secret=token_data["client_secret"],
-                token_uri="https://oauth2.googleapis.com/token",
-                scopes=["https://www.googleapis.com/auth/gmail.send"],
-            )
-            creds.refresh(Request())
-
-            service = build("gmail", "v1", credentials=creds)
-            msg_to_send = msg or self._build_mime_message(to_email, to_name)
-            raw = base64.urlsafe_b64encode(msg_to_send.as_bytes()).decode("utf-8")
-            service.users().messages().send(userId="me", body={"raw": raw}).execute()
-
-            logger.info(f"✅ Gmail API sent: {self.mailbox.email_address} → {to_email}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Gmail API error ({self.mailbox.email_address}): {e}")
-            return False
-
-    # ── SMTP: Send warmup email ──────────────────────────────────────────────
-    def _send_via_smtp(self, to_email: str, to_name: Optional[str] = None, msg: Optional[MIMEMultipart] = None) -> bool:
-        """Send a single warmup email via SMTP."""
-        try:
-            msg_to_send = msg or self._build_mime_message(to_email, to_name)
-
-            if self.mailbox.smtp_use_tls:
-                server = smtplib.SMTP(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-            else:
-                server = smtplib.SMTP_SSL(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=30)
-
             server.login(self.mailbox.smtp_user, self.smtp_password)
-            server.sendmail(self.mailbox.email_address, to_email, msg_to_send.as_string())
-            server.quit()
+            server.sendmail(self.mailbox.email_address, to_email, msg.as_string())
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
 
-            logger.info(f"✅ SMTP sent: {self.mailbox.email_address} → {to_email}")
+    def _send(self, msg: MIMEMultipart, to_email: str) -> bool:
+        """Send a built message via the mailbox's transport. Returns success."""
+        to_email = email.utils.parseaddr(to_email)[1] or to_email
+        try:
+            if self.auth_type == "microsoft_graph":
+                self._graph().send_mime(msg)
+            elif self.auth_type == "gmail_api":
+                self._send_via_gmail_api(msg)
+            else:
+                self._send_via_smtp(msg, to_email)
+            logger.info(f"✅ Sent ({self.auth_type}): {self.mailbox.email_address} → {to_email}")
             return True
         except Exception as e:
-            logger.error(f"❌ SMTP error ({self.mailbox.email_address}): {e}")
+            logger.error(f"❌ Send error ({self.auth_type}, {self.mailbox.email_address}): {e}")
             return False
 
-    # ── Smart dispatch ───────────────────────────────────────────────────────
     def send_warmup_email(self, to_email: str, to_name: Optional[str] = None) -> bool:
-        """Send warmup email — uses Gmail API if configured, else SMTP."""
-        auth_type = getattr(self.mailbox, "auth_type", "smtp") or "smtp"
-        if auth_type == "gmail_api":
-            return self._send_via_gmail_api(to_email, to_name)
-        return self._send_via_smtp(to_email, to_name)
+        """Send one warmup email using whichever transport the mailbox is configured for."""
+        return self._send(self._build_mime_message(to_email, to_name), to_email)
 
+    # ── IMAP plumbing ────────────────────────────────────────────────────────
+    def _imap_connect(self) -> imaplib.IMAP4:
+        if self.mailbox.imap_use_ssl:
+            mail = imaplib.IMAP4_SSL(self.mailbox.imap_host, self.mailbox.imap_port, timeout=30)
+        else:
+            mail = imaplib.IMAP4(self.mailbox.imap_host, self.mailbox.imap_port, timeout=30)
+            if "STARTTLS" in mail.capabilities:
+                mail.starttls()
 
+        user = self.mailbox.imap_user or self.mailbox.email_address
+        if self.auth_type == "gmail_api":
+            auth = f"user={user}\x01auth=Bearer {self._google_access_token()}\x01\x01".encode()
+            mail.authenticate("XOAUTH2", lambda _: auth)
+        else:
+            mail.login(user, self.imap_password)
 
-    # ── IMAP: Open unread warmup emails ─────────────────────────────────────
+        # Capabilities often grow after login (e.g. MOVE on Gmail)
+        _, caps = mail.capability()
+        self._imap_caps = set(caps[0].decode().upper().split()) if caps and caps[0] else set()
+        return mail
+
+    def _fetch_headers(self, mail: imaplib.IMAP4, uids: list) -> list:
+        """[(uid, email.message.Message)] — headers only, without setting \\Seen."""
+        if not uids:
+            return []
+        _, data = mail.uid("FETCH", b",".join(uids).decode(), _HEADER_FIELDS)
+        out = []
+        for item in data or []:
+            if isinstance(item, tuple) and len(item) == 2:
+                m = _UID_RE.search(item[0])
+                if m:
+                    out.append((m.group(1).decode(), email.message_from_bytes(item[1])))
+        return out
+
+    def _move_to_inbox(self, mail: imaplib.IMAP4, uid: str) -> bool:
+        """Move a message out of the selected folder into INBOX. Returns True if an expunge is pending."""
+        if "MOVE" in self._imap_caps:
+            typ, _ = mail.uid("MOVE", uid, "INBOX")
+            if typ == "OK":
+                return False
+        mail.uid("COPY", uid, "INBOX")
+        mail.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+        return True
+
+    # ── OPEN phase ───────────────────────────────────────────────────────────
     def open_warmup_emails(self) -> int:
         """
-        Connect via IMAP → find unread warmup emails → mark READ + IMPORTANT.
-        Uses subject keyword matching to avoid opening real emails.
-        Also moves warmup emails OUT of spam/promotions if found there.
+        Find unread warmup emails in INBOX and the spam folder → mark READ + STARRED.
+        Anything found in spam is moved back to INBOX (strongest trust signal).
         """
+        if self.auth_type == "microsoft_graph":
+            return self._graph_open_warmup_emails()
+
         opened_count = 0
         try:
-            if self.mailbox.imap_use_ssl:
-                mail = imaplib.IMAP4_SSL(self.mailbox.imap_host, self.mailbox.imap_port)
-            else:
-                mail = imaplib.IMAP4(self.mailbox.imap_host, self.mailbox.imap_port)
+            mail = self._imap_connect()
+            _, folder_list = mail.list()
+            folders = ["INBOX"] + find_junk_folders(folder_list)
 
-            mail.login(self.mailbox.imap_user, self.imap_password)
-
-            # Check INBOX first, then try Spam/Junk
-            folders_to_check = ["INBOX", "[Gmail]/Spam", "Junk", "Spam", "[Gmail]/Promotions"]
-            for folder in folders_to_check:
+            for folder in folders:
                 try:
-                    status, _ = mail.select(folder)
-                    if status != "OK":
+                    typ, _ = mail.select(_imap_quote(folder))
+                    if typ != "OK":
                         continue
+                    _, data = mail.uid("SEARCH", None, "UNSEEN")
+                    uids = data[0].split()[-30:] if data and data[0] else []
 
-                    _, message_ids = mail.search(None, "UNSEEN")
-                    if not message_ids[0]:
-                        continue
-
-                    ids = message_ids[0].split()
-                    for msg_id in ids[-30:]:  # process up to 30 per folder
+                    pending_expunge = False
+                    for uid, headers in self._fetch_headers(mail, uids):
+                        if not is_warmup_id(headers.get(WARMUP_HEADER)):
+                            continue
                         try:
-                            _, msg_data = mail.fetch(msg_id, "(RFC822)")
-                            raw_email = msg_data[0][1]
-                            parsed = email.message_from_bytes(raw_email)
-
-                            subject_raw = parsed.get("Subject", "")
-                            subject = decode_header(subject_raw)[0][0]
-                            if isinstance(subject, bytes):
-                                subject = subject.decode(errors="ignore")
-
-                            # Check if it's a warmup email by subject keyword match
-                            is_warmup = any(
-                                s.lower() in subject.lower()
-                                for s in WARMUP_SUBJECTS
-                            )
-                            if is_warmup:
-                                # Properly rescue from Spam/Promotions by moving to INBOX
-                                if folder.upper() != "INBOX":
-                                    mail.copy(msg_id, "INBOX")               # Copy to Inbox
-                                    mail.store(msg_id, "+FLAGS", "\\Deleted")# Delete from Spam
-                                    mail.expunge()                           # Ensure deletion
-                                    
-                                mail.store(msg_id, "+FLAGS", "\\Seen")      # Mark read
-                                mail.store(msg_id, "+FLAGS", "\\Flagged")   # Star it
-                                opened_count += 1
-                                logger.info(f"📬 Opened: '{subject[:50]}' in {self.mailbox.email_address}")
+                            # Flags first so they travel with the message when it's moved/copied
+                            mail.uid("STORE", uid, "+FLAGS", "(\\Seen \\Flagged)")
+                            if folder.upper() != "INBOX":
+                                pending_expunge |= self._move_to_inbox(mail, uid)
+                                logger.info(f"🛟 Rescued from {folder}: {self.mailbox.email_address}")
+                            opened_count += 1
+                            logger.info(f"📬 Opened: '{_decode_subject(headers.get('Subject', ''))[:50]}' in {self.mailbox.email_address}")
                         except Exception as e:
                             logger.warning(f"IMAP open error on msg: {e}")
-                except Exception:
-                    pass  # Folder doesn't exist for this provider — skip
+                    if pending_expunge:
+                        mail.expunge()
+                except Exception as e:
+                    logger.warning(f"IMAP folder {folder} skipped ({self.mailbox.email_address}): {e}")
 
             mail.logout()
-
         except Exception as e:
             logger.error(f"❌ IMAP error ({self.mailbox.email_address}): {e}")
 
         return opened_count
 
-    # ── IMAP: Reply to warmup emails ─────────────────────────────────────────
+    def _graph_open_warmup_emails(self) -> int:
+        opened_count = 0
+        g = self._graph()
+        for folder in ("inbox", "junkemail"):
+            try:
+                for m in g.list_recent(folder, is_read=False):
+                    if not is_warmup_id(graph.message_header(m, WARMUP_HEADER)):
+                        continue
+                    try:
+                        g.mark_read_and_flag(m["id"])
+                        if folder == "junkemail":
+                            g.move_to_inbox(m["id"])
+                            logger.info(f"🛟 Rescued from Junk: {self.mailbox.email_address}")
+                        opened_count += 1
+                        logger.info(f"📬 Opened: '{(m.get('subject') or '')[:50]}' in {self.mailbox.email_address}")
+                    except Exception as e:
+                        logger.warning(f"Graph open error on msg: {e}")
+            except Exception as e:
+                logger.error(f"❌ Graph error reading {folder} ({self.mailbox.email_address}): {e}")
+        return opened_count
+
+    # ── REPLY phase ──────────────────────────────────────────────────────────
     def reply_to_warmup_emails(self) -> int:
         """
         Find warmup emails in INBOX → reply to 85% of them with natural replies.
 
-        NO DUPLICATES: checks \\Answered flag before replying.
+        NO DUPLICATES: only replies to messages not yet marked answered.
         Each reply uses a random template, sender first name, and natural pacing.
-        Reply rate = 85% (high = signals real humans = great reputation boost).
         """
+        if self.auth_type == "microsoft_graph":
+            return self._graph_reply_to_warmup_emails()
+
         replied_count = 0
         try:
-            if self.mailbox.imap_use_ssl:
-                mail = imaplib.IMAP4_SSL(self.mailbox.imap_host, self.mailbox.imap_port)
-            else:
-                mail = imaplib.IMAP4(self.mailbox.imap_host, self.mailbox.imap_port)
-
-            mail.login(self.mailbox.imap_user, self.imap_password)
+            mail = self._imap_connect()
             mail.select("INBOX")
 
-            # Find emails that were READ but NOT yet ANSWERED — prevents duplicates
-            _, message_ids = mail.search(None, "SEEN", "NOT ANSWERED")
-            if not message_ids[0]:
-                mail.logout()
-                return 0
+            # Read but not yet answered — prevents duplicates
+            _, data = mail.uid("SEARCH", None, "SEEN", "UNANSWERED")
+            uids = data[0].split()[-30:] if data and data[0] else []
 
-            ids = message_ids[0].split()
-
-            # Filter to only warmup emails first
-            warmup_ids = []
-            for msg_id in ids[-30:]:
-                try:
-                    _, msg_data = mail.fetch(msg_id, "(RFC822)")
-                    parsed = email.message_from_bytes(msg_data[0][1])
-                    subject_raw = parsed.get("Subject", "")
-                    subject = decode_header(subject_raw)[0][0]
-                    if isinstance(subject, bytes):
-                        subject = subject.decode(errors="ignore")
-
-                    # Only reply to warmup emails (not random real emails)
-                    if any(s.lower() in subject.lower() for s in WARMUP_SUBJECTS):
-                        warmup_ids.append((msg_id, parsed))
-                except Exception:
-                    pass
+            warmup_msgs = [
+                (uid, h) for uid, h in self._fetch_headers(mail, uids)
+                if is_warmup_id(h.get(WARMUP_HEADER))
+            ]
 
             # Reply to 85% of warmup emails (very high = premium domain signal)
-            n_to_reply = max(1, int(len(warmup_ids) * 0.85))
-            reply_targets = random.sample(warmup_ids, min(n_to_reply, len(warmup_ids)))
-
-            for msg_id, parsed in reply_targets:
+            n_to_reply = max(1, int(len(warmup_msgs) * 0.85))
+            for uid, headers in random.sample(warmup_msgs, min(n_to_reply, len(warmup_msgs))):
                 try:
-                    from_addr = parsed.get("Reply-To") or parsed.get("From", "")
-                    original_subject = parsed.get("Subject", "No Subject")
+                    from_addr = headers.get("Reply-To") or headers.get("From", "")
+                    if not from_addr or self.mailbox.email_address.lower() in from_addr.lower():
+                        continue  # never reply to self
 
-                    if not from_addr:
+                    reply = self._build_reply(
+                        from_addr,
+                        _decode_subject(headers.get("Subject", "")),
+                        headers.get("Message-ID", ""),
+                        headers.get("References", ""),
+                    )
+                    if not self._send(reply, from_addr):
                         continue
-                    # Never reply to self
-                    if self.mailbox.email_address.lower() in from_addr.lower():
-                        continue
-
-                    # Build a natural reply with senderʼs first name
-                    reply_template = random.choice(WARMUP_REPLIES)
-
-                    reply = MIMEMultipart("alternative")
-                    reply["From"]       = f"{self.mailbox.display_name or self.mailbox.email_address} <{self.mailbox.email_address}>"
-                    reply["To"]         = from_addr
-                    reply["Subject"]    = f"Re: {original_subject}"
-                    reply["In-Reply-To"] = parsed.get("Message-ID", "")
-                    reply["References"]  = parsed.get("Message-ID", "")
-
-                    # Sign off with sender's first name
-                    sig = self._sender_signature()
-                    body = reply_template + f"\n\n— {sig}"
-                    reply.attach(MIMEText(body, "plain"))
-
-                    # Send reply using the correct auth route
-                    if getattr(self.mailbox, "auth_type", "smtp") == "gmail_api":
-                        self._send_via_gmail_api(to_email=from_addr, msg=reply)
-                    elif getattr(self.mailbox, "auth_type", "smtp") == "microsoft_graph":
-                        pass # self._send_via_microsoft_graph(to_email=from_addr, msg=reply)
-                    else:
-                        self._send_via_smtp(to_email=from_addr, msg=reply)
 
                     # Mark as ANSWERED — prevents future duplicate replies
-                    mail.store(msg_id, "+FLAGS", "\\Answered")
+                    mail.uid("STORE", uid, "+FLAGS", "(\\Answered)")
                     replied_count += 1
                     logger.info(f"↩️  Replied: {self.mailbox.email_address} → {from_addr}")
 
-                    # Random delay between replies (feels human)
-                    import time; time.sleep(random.uniform(5, 20))
-
+                    time.sleep(random.uniform(5, 20))  # feels human
                 except Exception as e:
                     logger.warning(f"Reply error: {e}")
 
             mail.logout()
-
         except Exception as e:
             logger.error(f"❌ IMAP reply error ({self.mailbox.email_address}): {e}")
 
         return replied_count
 
+    def _graph_reply_to_warmup_emails(self) -> int:
+        replied_count = 0
+        g = self._graph()
+        try:
+            candidates = [
+                m for m in g.list_recent("inbox", is_read=True)
+                if is_warmup_id(graph.message_header(m, WARMUP_HEADER)) and not graph.already_replied(m)
+            ]
+        except Exception as e:
+            logger.error(f"❌ Graph reply error ({self.mailbox.email_address}): {e}")
+            return 0
+
+        n_to_reply = max(1, int(len(candidates) * 0.85))
+        for m in random.sample(candidates, min(n_to_reply, len(candidates))):
+            try:
+                to_addr = graph.sender_address(m)
+                if not to_addr or to_addr.lower() == self.mailbox.email_address.lower():
+                    continue
+                reply = self._build_reply(
+                    to_addr,
+                    m.get("subject") or "",
+                    m.get("internetMessageId") or "",
+                    graph.message_header(m, "References") or "",
+                )
+                if not self._send(reply, to_addr):
+                    continue
+                g.mark_replied(m["id"])
+                replied_count += 1
+                logger.info(f"↩️  Replied: {self.mailbox.email_address} → {to_addr}")
+                time.sleep(random.uniform(5, 20))
+            except Exception as e:
+                logger.warning(f"Graph reply error: {e}")
+        return replied_count
+
     # ── Connection tests ─────────────────────────────────────────────────────
     def test_smtp_connection(self) -> tuple[bool, str]:
-        """Test SMTP credentials — returns (success, message)."""
+        """Test the sending side — returns (success, message)."""
         try:
+            if self.auth_type == "microsoft_graph":
+                me = self._graph().me()
+                signed_in = (me.get("mail") or me.get("userPrincipalName") or "").lower()
+                if signed_in != self.mailbox.email_address.lower():
+                    return False, f"Connected Microsoft account is {signed_in}, not {self.mailbox.email_address}"
+                return True, f"Microsoft Graph: signed in as {signed_in}"
+            if self.auth_type == "gmail_api":
+                self._google_access_token()
+                return True, "Gmail API token OK"
+
             if self.mailbox.smtp_use_tls:
                 server = smtplib.SMTP(self.mailbox.smtp_host, self.mailbox.smtp_port, timeout=15)
                 server.ehlo(); server.starttls(); server.ehlo()
@@ -573,14 +750,18 @@ class EmailService:
             return False, str(e)
 
     def test_imap_connection(self) -> tuple[bool, str]:
-        """Test IMAP credentials — returns (success, message)."""
+        """Test the reading side — returns (success, message)."""
         try:
-            if self.mailbox.imap_use_ssl:
-                mail = imaplib.IMAP4_SSL(self.mailbox.imap_host, self.mailbox.imap_port)
-            else:
-                mail = imaplib.IMAP4(self.mailbox.imap_host, self.mailbox.imap_port)
-            mail.login(self.mailbox.imap_user, self.imap_password)
+            if self.auth_type == "microsoft_graph":
+                self._graph().inbox_reachable()
+                return True, "Microsoft Graph: Inbox + Junk Email accessible"
+
+            mail = self._imap_connect()
+            _, folder_list = mail.list()
+            junk = find_junk_folders(folder_list)
             mail.logout()
-            return True, "IMAP connection successful"
+            if not junk:
+                return True, "IMAP connection successful (warning: no spam folder found — spam rescue disabled)"
+            return True, f"IMAP connection successful (spam folder: {', '.join(junk)})"
         except Exception as e:
             return False, str(e)

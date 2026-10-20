@@ -31,7 +31,7 @@ def seed_super_admin():
     try:
         existing = db.query(User).filter(User.email == settings.super_admin_email).first()
         if existing:
-            # Force sync the password in case it was changed in Railway ENV
+            # Force sync the password in case it was changed in the environment
             existing.password_hash = hash_password(settings.super_admin_password)
             db.commit()
             logger.info(f"✅ Super admin already exists. Password synchronized! (active={existing.is_active})")
@@ -125,28 +125,26 @@ app = FastAPI(
 )
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
+# Not needed when the frontend is served through the same origin (Docker/nginx);
+# kept for split deployments and the Vite dev server.
 _cors_origins = [
     "http://localhost:3000",
     "http://localhost:5173",
     "https://localhost:5173",
 ]
-# Add production frontend URL from env if set
-if settings.frontend_url and settings.frontend_url != "http://localhost:5173":
+if settings.frontend_url and settings.frontend_url not in _cors_origins:
     _cors_origins.append(settings.frontend_url)
-# Allow all Railway subdomains in production
-_cors_origins.append("https://emailwarmupagent-production.up.railway.app")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_origin_regex=r"https://.*\.up\.railway\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ── Static files (uploaded logos) ────────────────────────────────────────────
-os.makedirs("uploads/logos", exist_ok=True)
+os.makedirs(settings.upload_dir, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # ── Routers ───────────────────────────────────────────────────────────────────
